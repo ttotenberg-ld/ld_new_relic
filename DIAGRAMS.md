@@ -4,7 +4,10 @@
 
 ```mermaid
 flowchart TD
-    Start[Customer wants LD + NR integration] --> Q1{Using OTel SDK?}
+    Start[Customer wants LD + NR integration] --> Q0{Has NR Control / PCG deployed?}
+
+    Q0 -->|Yes| E1[Option E: PCG dual-export]
+    Q0 -->|No| Q1{Using OTel SDK?}
 
     Q1 -->|Yes| A1[Approach 1: OTel SDK + LD TracingHook]
     Q1 -->|No| Q2{Willing to adopt OTel?}
@@ -22,6 +25,7 @@ flowchart TD
     C1 --> Done2[Done - flags in NR + telemetry in LD]
     B1 --> Done3[Done - telemetry in LD via NR export]
     B2 --> Done4[Done - telemetry in LD via polling]
+    E1 --> Done5[Done - PCG forks to NR + LD]
 ```
 
 ## Option A: OTel Collector Dual-Export
@@ -65,6 +69,42 @@ flowchart LR
     Bus --> Fn[Transform Function<br/>NR JSON → OTLP]
 
     Fn -->|OTLP| LD[LaunchDarkly]
+```
+
+## Option E: Pipeline Control Gateway (PCG)
+
+```mermaid
+flowchart LR
+    subgraph AppA["App A (NR Agent)"]
+        Agent[NR APM Agent]
+        SDK1[LD Server SDK]
+        Hook1[TracingHook via OTel API]
+        SDK1 --> Hook1 --> Agent
+    end
+
+    subgraph AppB["App B (OTel SDK)"]
+        OTel[OTel SDK]
+        SDK2[LD Server SDK]
+        Hook2[TracingHook]
+        SDK2 --> Hook2 --> OTel
+    end
+
+    Agent -->|NR agent protocol| PCG
+    OTel -->|OTLP| PCG
+
+    subgraph PCG["Pipeline Control Gateway (OTel Collector in customer K8s)"]
+        RcvNR[newrelic receiver]
+        RcvOTLP[otlp receiver]
+        P1[Pipeline 1: batch]
+        P2[Pipeline 2: filter spanevents → filter spans → groupbytrace → batch]
+        RcvNR --> P1
+        RcvNR --> P2
+        RcvOTLP --> P1
+        RcvOTLP --> P2
+    end
+
+    P1 -->|ALL telemetry| NR[New Relic Cloud]
+    P2 -->|Guarded rollout spans only| LD[LaunchDarkly<br/>otel.observability.app.launchdarkly.com]
 ```
 
 ## Option D: LD New Relic Ingest Service

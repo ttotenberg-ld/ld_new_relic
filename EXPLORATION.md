@@ -126,7 +126,7 @@ LD exposes an **OTLP-compatible endpoint** that accepts traces:
 - **gRPC:** `otel.observability.app.launchdarkly.com:4317`
 - **HTTP:** `otel.observability.app.launchdarkly.com:4318`
 
-**Authentication:** Via resource attribute `launchdarkly.project_id` set to the SDK key. If using an LD SDK with TracingHook, this is set automatically. If using a standalone OTel SDK, set it via a `resource` processor in the Collector or in the app's OTel resource config.
+**Authentication:** Via resource attribute `launchdarkly.project_id` set to the SDK key. **You have to set this yourself** — the `TracingHook` in `@launchdarkly/node-server-sdk-otel` (v1.1.x, verified by reading source) adds `feature_flag` span events but does **not** modify the OTel resource. Set `launchdarkly.project_id` either on the app's OTel `Resource` at SDK init, or via a Collector resource processor. Without it, LD silently drops ingested data — the endpoint accepts the request (exporter reports success), but nothing shows up in the UI.
 
 LD extracts from ingested traces:
 - **Span events** named `feature_flag` where `feature_flag.result.reason.inExperiment == true` (i.e., flags in an active guarded rollout — not all flag evaluations)
@@ -169,8 +169,9 @@ receivers:
       http:
 
 processors:
-  # Set launchdarkly.project_id if NOT using an LD SDK (OTel-only setup).
-  # If using LD SDK with TracingHook, this is set automatically — skip this.
+  # Set launchdarkly.project_id. Required — TracingHook does NOT set this on
+  # the OTel resource, so either do it here or on the app's OTel Resource
+  # at SDK init (the app-side approach is cleaner and is what the demo uses).
   resource:
     attributes:
       - key: launchdarkly.project_id
@@ -252,7 +253,7 @@ service:
 
 **Cons:**
 - Requires OTel Collector in the pipeline (most OTel customers have this already)
-- Doesn't help NR-agent-only customers (they don't export OTLP)
+- Does not directly help NR-agent-only customers unless they adopt an OTel Collector. NR's own Pipeline Control Gateway — covered in Option E — fills this gap by exposing a Collector-compatible forking point that natively accepts the NR agent protocol.
 
 **Verdict: Primary recommendation for OTel customers. Same as Dynatrace.**
 
@@ -383,20 +384,61 @@ LaunchDarkly (New Relic Ingest Service)
 
 **Verdict: Highest long-term value. This is the "do it right" option. Start with D1 (polling) as MVP, graduate to D2 (streaming) for scale.**
 
+### Option E: Pipeline Control Gateway (PCG)
+
+**For NR customers on the Control tier — works for both NR-agent and OTel customers.**
+
+[Pipeline Control Gateway](https://docs.newrelic.com/docs/new-relic-control/pipeline-control/overview/) is an OpenTelemetry Collector (upstream v0.131.0) that NR packages, Helm-charts, and supports. It runs in the customer's own Kubernetes cluster and sits between their apps and NR cloud. Unlike a plain OTel Collector, PCG ships with a native receiver for the NR agent protocol — so NR APM agents can be pointed at PCG and their telemetry forked from there.
+
+```
+NR APM Agent ─┐
+              │
+              ├──► Pipeline Control Gateway (OTel Collector in customer's K8s)
+OTel SDK     ─┤          │
+              │          ├──► NR Cloud (full fidelity)
+              │          │
+              │          └──► LaunchDarkly OTLP (filtered: guarded-rollout data only)
+```
+
+**How it works:**
+1. Customer deploys PCG via NR's Helm chart and edits `values-newrelic-gateway.yaml`
+2. NR agents are reconfigured (`host` / `NEW_RELIC_HOST`) to export to PCG instead of `collector.newrelic.com`
+3. OTel SDK apps export OTLP directly to PCG
+4. Add a second exporter (LD OTLP) and the LD OTTL filter chain (identical to Option A) to PCG config
+5. PCG forks: everything to NR, guarded-rollout data to LD. Internally, PCG converts NR agent data to OTLP before routing through processors.
+
+**Key difference from Option A:** PCG's `newrelic` receiver means NR-agent customers don't need to migrate to OTel SDK or run a separate Collector — they already have one (PCG), they just need to edit its config.
+
+**Pros:**
+- Works for both NR-agent and OTel customers — single forking mechanism
+- LD filter config is identical to the LD docs (copy-paste OTTL)
+- Sub-second latency (same as Option A)
+- No Data Plus required
+- NR owns the Helm chart and operational burden of PCG itself
+
+**Cons:**
+- Requires NR Control tier — not all NR customers have PCG deployed
+- NR's support posture on custom exporters added by customers is a gray area (officially customer-editable, but adding non-NR destinations may fall outside supported configs)
+- NR agents must be reconfigured to point at PCG (small config change per host)
+- PCG adoption is currently low, though growing as NR promotes Control
+- Round-trip fidelity of span events through the NR-agent protocol → PCG → OTLP path needs empirical validation (PoC target)
+
+**Verdict: Best option for NR-agent customers who have Control. Matches Option A's properties without requiring migration to OTel SDK. The open question — does span-event data added via the NR agent's OTel API survive the NR-agent-protocol → PCG → OTLP round-trip in a shape that the LD OTTL filter matches? — is the key thing to validate in a PoC.**
+
 ---
 
 ## Option Comparison Matrix
 
-| | OTel Collector (A) | NR Streaming Export (B) | NerdGraph Polling (C) | LD Ingest Service (D) |
-|---|---|---|---|---|
-| **Works for OTel customers** | Yes | Yes | Yes | Yes |
-| **Works for NR-agent-only** | No | Yes | Yes | Yes |
-| **Latency** | Sub-second | ~1 min | ~1 min+ | Depends on sub-option |
-| **Customer infra required** | OTel Collector | Cloud function | Cron job | None |
-| **NR tier required** | Any | Data Plus | Any | Any (D1) / Data Plus (D2) |
-| **LD engineering effort** | None (existing) | Docs only | Docs only | Significant |
-| **Data reduction** | Very high (only active guarded rollout spans) | NRQL WHERE filter | NRQL WHERE filter | Server-side |
-| **Production readiness** | High | Medium | Low | High (once built) |
+| | OTel Collector (A) | NR Streaming Export (B) | NerdGraph Polling (C) | LD Ingest Service (D) | Pipeline Control Gateway (E) |
+|---|---|---|---|---|---|
+| **Works for OTel customers** | Yes | Yes | Yes | Yes | Yes |
+| **Works for NR-agent-only** | No | Yes | Yes | Yes | Yes |
+| **Latency** | Sub-second | ~1 min | ~1 min+ | Depends on sub-option | Sub-second |
+| **Customer infra required** | OTel Collector | Cloud function | Cron job | None | PCG (Helm-installed) |
+| **NR tier required** | Any | Data Plus | Any | Any (D1) / Data Plus (D2) | Control |
+| **LD engineering effort** | None (existing) | Docs only | Docs only | Significant | Docs only |
+| **Data reduction** | Very high (only active guarded rollout spans) | NRQL WHERE filter | NRQL WHERE filter | Server-side | Very high (same OTTL as A) |
+| **Production readiness** | High | Medium | Low | High (once built) | High (needs fidelity validation) |
 
 ---
 
@@ -408,22 +450,28 @@ LaunchDarkly (New Relic Ingest Service)
 - **Deliverable:** Collector config + docs showing NR + LD dual-export
 - This is the same pattern as Dynatrace. Validate it works with NR's OTLP endpoint.
 
-### Phase 2: NR Agent Hook (Approach 2 from Goal 1)
-- **Effort:** Medium (per-language hook implementations)
-- **Target:** NR-agent-only customers who want flag enrichment in NR dashboards
-- **Deliverable:** `@launchdarkly/newrelic-agent-hook` package(s)
-- This gives NR-agent customers flag visibility in New Relic, even without the LD routing.
+### Phase 2: Pipeline Control Gateway PoC (Option E)
+- **Effort:** Low-Medium (PCG handles the infrastructure; customer-side is config-only)
+- **Target:** NR-agent customers on Control, and OTel customers who already deploy PCG
+- **Deliverable:** `values-newrelic-gateway.yaml` with LD dual-export + docs
+- Validates that NR-agent span events round-trip cleanly through PCG to LD's OTTL filter. If yes, this supersedes most of the NR-agent-hook workstream for Control customers.
 
-### Phase 3: NerdGraph Polling PoC (Option C)
+### Phase 3: NR Agent Hook (Approach 2 from Goal 1)
+- **Effort:** Medium (per-language hook implementations)
+- **Target:** NR-agent customers without Control (no PCG) who want flag enrichment in NR dashboards
+- **Deliverable:** `@launchdarkly/newrelic-agent-hook` package(s)
+- Narrower target market now that PCG exists, but still relevant for non-Control customers.
+
+### Phase 4: NerdGraph Polling PoC (Option C)
 - **Effort:** Low-Medium
-- **Target:** Prove out LD ingest from NR for non-OTel customers
+- **Target:** Prove out LD ingest from NR for non-OTel, non-PCG customers
 - **Deliverable:** Reference implementation / internal tool
 
-### Phase 4: LD New Relic Ingest Service (Option D)
+### Phase 5: LD New Relic Ingest Service (Option D)
 - **Effort:** High
 - **Target:** All NR customers, seamless UX
 - **Deliverable:** First-party integration in LD dashboard (like Datadog Agent integration)
-- Start with NerdGraph polling (D1), add Streaming Export support (D2) for scale
+- PCG reduces the urgency of D for Control customers, but D remains the cleanest UX for the long tail of customers who don't have PCG and don't want to run their own infrastructure.
 
 ---
 

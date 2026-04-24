@@ -1,0 +1,74 @@
+# ---- Secrets / environment ----
+# The demo/.env in this repo currently holds real LaunchDarkly + New Relic
+# credentials. Never commit it. Commit .env.example instead.
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# ---- Node.js ----
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.npm
+.yarn/
+.pnp.*
+.eslintcache
+.parcel-cache/
+coverage/
+*.tsbuildinfo
+
+# ---- New Relic agent ----
+# The newrelic Node agent writes logs next to the service when started.
+newrelic_agent.log
+newrelic-agent.log
+newrelic-audit.log
+
+# ---- OpenTelemetry / runtime artifacts ----
+*.log
+logs/
+*.pid
+*.seed
+*.pid.lock
+
+# ---- Docker / build output ----
+dist/
+build/
+out/
+tmp/
+.tmp/
+
+# ---- Helm / Kubernetes ----
+# Keep values-*.yaml committed (e.g. values-newrelic-gateway.yaml), but ignore
+# locally rendered charts, packaged tgzs, and kubeconfigs.
+charts/*.tgz
+**/charts/*.tgz
+*.kubeconfig
+kubeconfig
+
+# ---- macOS / Windows / Linux ----
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ---- Editors / IDEs ----
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+.cursor/
+
+# ---- Local agent / tooling state ----
+.claude/

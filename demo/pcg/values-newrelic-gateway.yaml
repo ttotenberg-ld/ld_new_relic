@@ -1,0 +1,99 @@
+# Pipeline Control Gateway (newrelic/pipeline-control-gateway) — Helm values.
+#
+# This file overrides parts of the chart's default `generated:` OTel Collector
+# config to add a LaunchDarkly OTLP exporter, two OTTL filter processors, and a
+# dedicated `traces/launchdarkly` pipeline. All existing NR pipelines from the
+# chart defaults (traces/nr, traces/otlp, metrics/*, logs/*) are preserved via
+# Helm's deep merge — we only add to `generated:`, we don't replace it.
+#
+# Install:
+#   helm repo add newrelic https://helm-charts.newrelic.com
+#   helm repo update
+#   helm upgrade --install pipeline-control-gateway \
+#     newrelic/pipeline-control-gateway \
+#     --namespace newrelic --create-namespace \
+#     --values values-newrelic-gateway.yaml \
+#     --set licenseKey=$NEW_RELIC_LICENSE_KEY \
+#     --set cluster=ld-nr-demo
+
+cluster: "ld-nr-demo"
+licenseKey: ""  # set via --set licenseKey=$NEW_RELIC_LICENSE_KEY
+
+# Single-replica is enough for a PoC.
+autoscaling:
+  minReplicas: 1
+  maxReplicas: 1
+
+generated:
+  # Override the default nrproprietaryreceiver to point at NR production
+  # (chart defaults target NR staging endpoints).
+  receivers:
+    nrproprietaryreceiver:
+      proxy: false
+      enable_runtime_metrics: true
+      server:
+        endpoint: "0.0.0.0:80"
+      nr_host: "collector.newrelic.com"
+      endpoints:
+        infra_event_api_endpoint: "https://infra-api.newrelic.com"
+        log_api_endpoint: "https://log-api.newrelic.com"
+        event_api_endpoint: "https://insights-collector.newrelic.com"
+        traces_endpoint: "https://trace-api.newrelic.com"
+        metrics_endpoint: "https://metric-api.newrelic.com"
+      logfilter:
+        enabled: false
+      enable_default_host: false
+      client:
+        compression: "gzip"
+    # Override the default OTLP receiver bindings. The chart default uses
+    # ${env:MY_POD_IP}, which is the pod's cluster IP — this breaks
+    # `kubectl port-forward`, since it connects to localhost inside the pod's
+    # network namespace. Binding to 0.0.0.0 makes the receiver reachable both
+    # via the Service (cluster IP) and via port-forward (localhost).
+    otlp/receiver:
+      protocols:
+        http:
+          endpoint: "0.0.0.0:4318"
+        grpc:
+          endpoint: "0.0.0.0:4317"
+
+  # PCG is a restricted OTel Collector build — only a subset of processors is
+  # permitted. As of chart 2.0.2 / appVersion 2.0.1 the allowlist is:
+  #   filter, transform, memory_limiter, cumulativetodelta,
+  #   telemetrybytesprocessor, probabilistic_sampler
+  # Notably NO `batch` and NO `groupbytrace`. That means trace reassembly
+  # (groupbytrace) has to be done upstream (in the LD backend — OTLP servers
+  # accept partial batches and assemble by trace_id) or not at all. For this
+  # PoC we skip both; the LD filter chain still runs.
+  processors:
+    # LD filter stage 1: keep only span events relevant to guarded rollouts
+    # (feature_flag events in experiment + exception events). Verbatim from
+    # https://launchdarkly.com/docs/sdk/features/opentelemetry-server-side
+    filter/launchdarkly-spanevents:
+      error_mode: ignore
+      traces:
+        spanevent:
+          - 'not ((name == "feature_flag" and attributes["feature_flag.result.reason.inExperiment"] == true) or name == "exception")'
+
+    # LD filter stage 2: drop spans with no http.route and no surviving events.
+    filter/launchdarkly-spans:
+      error_mode: ignore
+      traces:
+        span:
+          - 'not (attributes["http.route"] != nil or Len(events) > 0)'
+
+  exporters:
+    # LaunchDarkly OTLP endpoint. No auth header — the TracingHook sets
+    # the launchdarkly.project_id resource attribute for routing.
+    otlphttp/launchdarkly:
+      endpoint: https://otel.observability.app.launchdarkly.com:4318
+
+  service:
+    pipelines:
+      # Fork both origins (OTLP + NR agent) into the LD filter pipeline.
+      "traces/launchdarkly":
+        receivers: [otlp/receiver, nrproprietaryreceiver]
+        processors:
+          - filter/launchdarkly-spanevents
+          - filter/launchdarkly-spans
+        exporters: [otlphttp/launchdarkly]

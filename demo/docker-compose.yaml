@@ -1,0 +1,47 @@
+services:
+  nr-agent-service:
+    build: ./services/nr_agent_service
+    container_name: nr-agent-service
+    environment:
+      PORT: "3001"
+      LD_SDK_KEY: "${LD_SDK_KEY:-}"
+      LD_FLAG_KEY: "${LD_FLAG_KEY:-demo-rollout}"
+      NEW_RELIC_APP_NAME: "ld-nr-demo-agent-service"
+      NEW_RELIC_LICENSE_KEY: "${NEW_RELIC_LICENSE_KEY:-}"
+      # NR Node agent v11+ forces TLS and cannot be downgraded to plain HTTP
+      # ("SSL config key can no longer be disabled" warning in logs). PCG's
+      # nrproprietaryreceiver ships plain HTTP only (see PCG_FINDINGS.md).
+      # Pointing the agent directly at NR cloud for now — skips PCG for the
+      # NR-agent leg, but proves the OTel bridge + LD hook path works.
+      NEW_RELIC_HOST: "${NEW_RELIC_HOST:-collector.newrelic.com}"
+      NEW_RELIC_LOG_LEVEL: "info"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "3001:3001"
+
+  otel-service:
+    build: ./services/otel_service
+    container_name: otel-service
+    environment:
+      PORT: "3002"
+      LD_SDK_KEY: "${LD_SDK_KEY:-}"
+      LD_FLAG_KEY: "${LD_FLAG_KEY:-demo-rollout}"
+      OTEL_SERVICE_NAME: "ld-nr-demo-otel-service"
+      # Point OTel SDK at PCG's OTLP/HTTP receiver on the host.
+      OTEL_EXPORTER_OTLP_ENDPOINT: "${OTEL_EXPORTER_OTLP_ENDPOINT:-http://host.docker.internal:4318}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "3002:3002"
+
+  simulator:
+    build: ./simulator
+    container_name: traffic-simulator
+    environment:
+      NR_AGENT_URL: "http://nr-agent-service:3001"
+      OTEL_URL: "http://otel-service:3002"
+      TARGET_RPS: "${TARGET_RPS:-10}"
+    depends_on:
+      - nr-agent-service
+      - otel-service

@@ -1,0 +1,17 @@
+{
+  "name": "nr-agent-service",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fastify service instrumented with the New Relic APM agent + LaunchDarkly TracingHook via the OTel API bridge.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node -r newrelic index.js"
+  },
+  "dependencies": {
+    "@launchdarkly/node-server-sdk": "^9.7.1",
+    "@launchdarkly/node-server-sdk-otel": "^1.1.0",
+    "@opentelemetry/api": "^1.9.0",
+    "fastify": "^4.28.1",
+    "newrelic": "^12.5.0"
+  }
+}
