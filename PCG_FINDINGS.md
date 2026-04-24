@@ -667,37 +667,36 @@ from a transaction's start time, not as absolute timestamps. PCG's
 offsets directly, without anchoring to the transaction's wall-clock
 start. Result: every NR-origin span ends up at the Unix epoch.
 
-**Impact**
+**Impact (observed, narrower than initially hypothesised)**
 
-- Any OTLP consumer that trusts span timestamps for timeline placement —
-  trace waterfall views, time-window alerts, retention policies — will
-  place every NR-origin span at 1970.
-- LaunchDarkly's OTel observability endpoint is likely to reject or hide
-  spans whose end time is decades in the past, defeating the forking
-  story this whole integration is built around. (Bytes reach LD, signal
-  doesn't surface.)
-- The `nrcollectorexporter` path is unaffected — proprietary-to-NR-cloud
-  forwarding carries the original payload intact, so NR Distributed
-  Tracing still works. Only the OTel-shaped export is broken.
+End-to-end testing shows LaunchDarkly's OTel ingest *does* place these
+spans at correct wall-clock time in the UI, despite what the debug
+exporter prints. So either (a) the `debug` exporter's text formatter
+renders a zero/unset field as `1970-01-01` for NR-origin spans even when
+the on-the-wire OTLP protobuf carries valid timestamps, or (b) LD's
+backend reconstructs timestamps from send-time metadata. Either way, LD
+ingest isn't the blocker we feared.
 
-**Workaround**
+Still a real concern for any OTel consumer that doesn't do that
+reconstruction — a self-hosted Tempo/Jaeger or a plain OTLP collector
+logging this output will show every NR-origin span at the Unix epoch.
+And the internal `debug` exporter's logs are now misleading for anyone
+debugging an NR-agent-origin pipeline: timestamps look catastrophically
+broken when they're not.
 
-None practical inside PCG. OTTL's `transform` processor can rewrite
-timestamps, but by the time processors run the real start time has
-already been flattened to epoch — the information is gone. The only
-host-side workaround is to bypass the proprietary path entirely: enable
-the NR Node agent's OpenTelemetry bridge
-(`opentelemetry_bridge.enabled: true`) and export OTLP directly to PCG's
-`otlp/receiver`. That works for user-created spans but not for
-auto-instrumented ones (see #6).
+The `nrcollectorexporter` path is unaffected — proprietary-to-NR-cloud
+forwarding carries the original payload intact, so NR Distributed
+Tracing still works.
 
-**Suggested fix**
+**Suggested fix / investigation**
 
-`nrproprietaryreceiver` should extract the transaction's wall-clock start
-from the proprietary payload (it's encoded there — the agent sends
-timestamps in its metric/event payloads and absolute timestamps in its
-span events) and anchor each span's `start_time_unix_nano` to
-`transaction_start + relative_offset`.
+Confirm whether the zero timestamps are (a) a debug-exporter rendering
+bug specific to the shape of resources that `nrproprietaryreceiver`
+produces or (b) real zeros in the OTLP output that LD is smoothing over
+at ingest. If (b), `nrproprietaryreceiver` should still populate
+`start_time_unix_nano` / `end_time_unix_nano` properly from the agent's
+transaction timestamps so that non-LD OTLP consumers work without
+relying on LD-specific reconstruction.
 
 ---
 
@@ -764,10 +763,11 @@ exporter derive paths. The current chart default concatenates incorrectly.
 2. **Should-fix (blocker for arm64)**: PCG image is single-arch (AMD64
    only). On arm64 nodes — Apple Silicon, Graviton — the image runs under
    emulation and outbound TLS handshakes corrupt. See #7.
-3. **Should-fix (blocker for OTel forking)**: `nrproprietaryreceiver`
-   emits NR-origin spans with `start_time_unix_nano = 0`. Any OTel
-   consumer that trusts timestamps (including LD) will reject or misplace
-   every NR-agent-originated span. See #9.
+3. **Investigate**: `nrproprietaryreceiver` appears to emit NR-origin
+   spans with zero / epoch timestamps as seen by the `debug` exporter.
+   LD ingest places the spans correctly regardless (not a blocker there),
+   but either the debug output is misrendering valid timestamps or LD is
+   doing backend reconstruction that other OTLP consumers won't. See #9.
 4. **Should-fix (major for OTel forking)**: `nrproprietaryreceiver`
    doesn't map the NR agent's `app_name` onto `service.name` on
    translated resources. Every NR-agent trace looks unattributed in the
