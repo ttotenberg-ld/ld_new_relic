@@ -102,7 +102,7 @@ async function main() {
 
   app.get('/health', async () => ({ status: 'ok', service: 'nr-agent-service' }));
 
-  app.get('/checkout', async (request, reply) => {
+  app.get('/checkout', async () => {
     const context = randomContext();
     let variation = 'control';
     if (ld) {
@@ -113,7 +113,7 @@ async function main() {
     return { ok: true, flag: FLAG_KEY, variation, context };
   });
 
-  app.get('/search', async (request, reply) => {
+  app.get('/search', async () => {
     const context = randomContext();
     let variation = 'control';
     if (ld) {

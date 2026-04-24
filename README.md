@@ -1,6 +1,6 @@
 # LaunchDarkly + New Relic Integration
 
-Research exploration for enriching New Relic spans with LaunchDarkly feature flag data and routing telemetry to LD for Guarded Rollouts.
+Research exploration for enriching New Relic spans with LaunchDarkly feature-flag data and routing relevant telemetry to LaunchDarkly for Guarded Rollouts.
 
 ## Documents
 
@@ -8,36 +8,43 @@ Research exploration for enriching New Relic spans with LaunchDarkly feature fla
 |------|-------------|
 | [EXPLORATION.md](./EXPLORATION.md) | Full technical exploration — approaches, options, tradeoffs, and phased recommendation |
 | [DIAGRAMS.md](./DIAGRAMS.md) | Architecture diagrams (Mermaid) for each option |
-| [PCG_FINDINGS.md](./PCG_FINDINGS.md) | Issues found in the New Relic PCG Helm chart while building the PoC — shareable with the NR team |
+| [PCG_FINDINGS.md](./PCG_FINDINGS.md) | Issues surfaced in NR's Pipeline Control Gateway while building the PoC — written to be shareable with the NR team |
+| [demo/README.md](./demo/README.md) | Run instructions for the working PoC |
 
 ## TL;DR
 
-Two goals:
-1. **Enrich NR spans with flag data** — so customers can query flag impact in New Relic dashboards
+Two goals for joint LD + NR customers:
+
+1. **Enrich NR spans with flag data** — so customers can query flag impact directly in their NR dashboards
 2. **Route telemetry to LD** — so Guarded Rollouts can detect regressions and auto-rollback
 
-Five options for getting data to LD, depending on customer setup:
+### What a Good Customer Experience Looks Like
 
-| Option | Best for | Latency | LD effort |
-|--------|----------|---------|-----------|
-| **A: OTel Collector dual-export** | OTel customers | Sub-second | None (reuse Dynatrace pattern) |
-| **B: NR Streaming Export** | NR-agent + Data Plus customers | ~1 min | Docs |
-| **C: NerdGraph polling** | PoC / small scale | ~1 min+ | Reference impl |
-| **D: LD NR Ingest Service** | All NR customers (long-term) | Varies | Significant |
-| **E: Pipeline Control Gateway** | NR Control customers (NR-agent or OTel) | Sub-second | Docs |
+The most ergonomic outcome for joint customers is **zero new customer infrastructure**: the NR APM agent (or NR's Collector distribution) natively recognises LaunchDarkly as a destination. Neither exists today; both are things to engage NR on. See the "Most Ergonomic End-State" section in [EXPLORATION.md](./EXPLORATION.md).
 
-**Recommended start:** Option A for OTel customers; Option E for NR-agent customers who have NR Control. Both use the same LD OTTL filter. Evaluate Option D as a first-party integration once PCG adoption is better understood.
+Until then, five options exist depending on the customer's NR setup:
 
-## Comparison with Dynatrace Exploration
+| Option | Best for | Latency | LD effort | Customer infrastructure |
+|--------|----------|---------|-----------|------------------------|
+| **A: OTel Collector dual-export** | OTel SDK customers | Sub-second | None (existing config) | None new (if already running a Collector) |
+| **D: LD-built NR Ingest Service** | All NR customers (long-term) | Sub-second / ~1 min | Significant | None |
+| **E: Pipeline Control Gateway** | NR Control customers | Sub-second | Docs + coordination with NR | PCG (often already deployed) |
+| **B: NR Streaming Export** | NR-agent + Data Plus customers | ~1 min | Docs | Cloud function |
+| **C: NerdGraph polling** | PoC / small scale | ~1 min+ | Reference impl | Cron job |
 
-The core pattern is the same: **OTel SDK + LD TracingHook + Collector dual-export**. Key differences:
+### Recommended Ordering
 
-- New Relic's OTLP support is more mature than Dynatrace's — simpler Collector config
-- No equivalent to Dynatrace OneAgent SDK hooks needed (NR agent APIs are simpler)
-- New Relic Streaming Export is a viable alternative path that Dynatrace didn't offer
-- **Pipeline Control Gateway** (NR Control) is effectively an NR-packaged OTel Collector with a native NR-agent-protocol receiver, giving NR-agent customers the same forking capability as Option A without migrating off their agents
-- Biggest opportunity: building a first-party LD ingest service for NR (like the existing Datadog integration)
+1. **Ship Option A today** — it's the lowest-cost win for OTel SDK customers. Zero new LD code; the existing `@launchdarkly/*-otel` TracingHook + LD's published Collector config already work.
+2. **Publish a native-API hook per NR agent language** (Goal 1 for NR-agent customers) — one small LD package per language, using the agent's `addCustomSpanAttribute` API. Gives those customers immediate value in NR dashboards even before Goal 2 is in place.
+3. **Invest in Option D** — an LD-managed NR Ingest Service gives NR-agent customers the same "configure once in the LD UI" experience joint customers expect. This is the most ergonomic no-new-infrastructure path.
+4. **Engage NR on native integration** — either as a "LaunchDarkly destination" preset in PCG, or as a native filter/fork option in the NR APM agent itself. Either would substantially simplify the joint customer story.
+
+### Key Gotchas (Captured While Building the PoC)
+
+- The LD `TracingHook` adds span events but **does not** set `launchdarkly.project_id` on the OTel resource. Without that attribute, LD's OTLP endpoint silently drops the data. Set it on the app's OTel Resource at SDK init (or via a Collector resource processor).
+- For NR APM agent customers on Node.js, the agent's OTel bridge does not currently support `addEvent` on auto-instrumented spans — the standard LD TracingHook fails silently. Use a native-API hook instead (example in `demo/services/nr_agent_service/`).
+- PCG has several rough edges that affect the NR-agent leg today — reproducible issues with reproductions, impact, and suggested fixes in [PCG_FINDINGS.md](./PCG_FINDINGS.md).
 
 ## Demo
 
-A working PoC lives in [`demo/`](./demo/) — simulator + NR-agent service + OTel service + PCG Helm values, all wired together. See [demo/README.md](./demo/README.md) for run instructions.
+A working PoC is in [`demo/`](./demo/) — simulator + NR APM agent service + OTel SDK service + PCG Helm values. The OTel SDK → PCG → NR + LD leg is validated end-to-end. See [demo/README.md](./demo/README.md) for run instructions.

@@ -1,4 +1,17 @@
 services:
+  # TLS terminator in front of PCG. NR Node agent v11+ forces TLS; PCG's
+  # nrproprietaryreceiver ships plain HTTP only. Caddy accepts TLS on :443
+  # with a self-signed cert (see pcg/tls/) and forwards plain HTTP to PCG
+  # via host.docker.internal:80 (where kubectl port-forward is listening).
+  pcg-tls:
+    image: caddy:2-alpine
+    container_name: pcg-tls
+    volumes:
+      - ./pcg/tls:/certs:ro
+      - ./pcg/tls/Caddyfile:/etc/caddy/Caddyfile:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
   nr-agent-service:
     build: ./services/nr_agent_service
     container_name: nr-agent-service
@@ -8,15 +21,15 @@ services:
       LD_FLAG_KEY: "${LD_FLAG_KEY:-demo-rollout}"
       NEW_RELIC_APP_NAME: "ld-nr-demo-agent-service"
       NEW_RELIC_LICENSE_KEY: "${NEW_RELIC_LICENSE_KEY:-}"
-      # NR Node agent v11+ forces TLS and cannot be downgraded to plain HTTP
-      # ("SSL config key can no longer be disabled" warning in logs). PCG's
-      # nrproprietaryreceiver ships plain HTTP only (see PCG_FINDINGS.md).
-      # Pointing the agent directly at NR cloud for now — skips PCG for the
-      # NR-agent leg, but proves the OTel bridge + LD hook path works.
-      NEW_RELIC_HOST: "${NEW_RELIC_HOST:-collector.newrelic.com}"
+      # Agent → pcg-tls (Caddy) → PCG :80. Agent trusts the self-signed cert
+      # via NODE_EXTRA_CA_CERTS (mounted below).
+      NEW_RELIC_HOST: "${NEW_RELIC_HOST:-pcg-tls}"
       NEW_RELIC_LOG_LEVEL: "info"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      NODE_EXTRA_CA_CERTS: "/certs/cert.pem"
+    volumes:
+      - ./pcg/tls/cert.pem:/certs/cert.pem:ro
+    depends_on:
+      - pcg-tls
     ports:
       - "3001:3001"
 

@@ -31,6 +31,11 @@ works for both services.
 - `kind`, `kubectl`, `helm` (for PCG — see [pcg/INSTALL.md](./pcg/INSTALL.md))
 - LaunchDarkly server-side SDK key
 - New Relic ingest license key
+- A host that can run the PCG container natively. The PCG image is AMD64-only
+  — Apple Silicon / Graviton dev machines work for the OTel SDK leg of the
+  demo, but the NR-agent leg fails under QEMU emulation (see
+  [`../PCG_FINDINGS.md`](../PCG_FINDINGS.md) #7). For that leg, use a native
+  amd64 host — see [DEPLOY_EC2.md](./DEPLOY_EC2.md).
 
 ## Setup
 

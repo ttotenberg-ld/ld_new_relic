@@ -1,0 +1,13 @@
+{
+	auto_https off
+	admin off
+}
+
+:443 {
+	tls /certs/cert.pem /certs/key.pem
+
+	# Forward everything to PCG's nrproprietaryreceiver on the host.
+	# host.docker.internal + kubectl port-forward makes this resolve to
+	# the in-cluster Service on plain HTTP :80.
+	reverse_proxy http://host.docker.internal:80
+}

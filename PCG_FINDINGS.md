@@ -446,25 +446,88 @@ Or install the LaunchDarkly TracingHook on the LD SDK and watch for the
 
 ---
 
+## 7. PCG image is AMD64-only — crypto fails under QEMU emulation on Apple Silicon
+
+**Symptoms**
+
+On a local Apple Silicon (arm64) machine running kind, after configuring a
+TLS terminator in front of PCG so the NR Node agent can reach
+`nrproprietaryreceiver`, the agent's `preconnect` handshake fails. PCG's
+log:
+
+```
+{"level":"error","msg":"Failed to process request",
+ "error":"Post \"https://collector.newrelic.com/agent_listener/invoke_raw_method?
+          ...method=preconnect...\": local error: tls: bad record MAC",
+ "status_code":500,
+ "pcg_request_path":"agent_listener/invoke_raw_method",
+ "user_agent":"NewRelic-NodeAgent/12.25.1 (nodejs 20.20.2 linux-arm64)"}
+```
+
+The `nrproprietaryreceiver` acts as a **proxy** during the NR-agent
+handshake — when the agent sends `preconnect`, PCG forwards that request to
+`collector.newrelic.com` to discover the real collector host. On arm64
+macOS via Docker Desktop, this outbound TLS call fails intermittently with
+`bad record MAC`.
+
+**Diagnosis**
+
+```bash
+kubectl describe node  # kubernetes.io/arch=arm64
+kubectl exec <pcg-pod> -- uname -m  # → x86_64
+docker manifest inspect newrelic/pipeline-control-gateway:2.0.1
+# Single-arch manifest — no arm64 variant published.
+```
+
+The PCG image is AMD64-only, so Docker Desktop on Apple Silicon pulls it and
+runs it under QEMU user-mode emulation. QEMU's emulated crypto is well
+known to produce subtle issues on long-lived or complex TLS handshakes.
+OTLP export from PCG to `otlp.nr-data.net` works (short, simple HTTPS
+calls), but the NR-agent preconnect round-trip trips.
+
+**Impact**
+
+- Any developer on Apple Silicon (fairly common) cannot validate the
+  NR-agent → PCG leg locally in kind / minikube / Docker Desktop.
+- Customers running K8s on arm64 nodes (AWS Graviton, Ampere, etc.)
+  cannot deploy PCG at all.
+
+**Workarounds**
+
+- Run the validation on an AMD64 machine / CI runner.
+- Use an arm64 remote dev environment.
+- Wait for NR to publish a multi-arch image.
+
+**Suggested fix**
+
+Build and publish `newrelic/pipeline-control-gateway` as a multi-arch image
+(AMD64 + arm64). Go cross-compiles cleanly, and most of the runtime
+dependencies (OTel Collector, Go crypto) already support arm64 upstream.
+
+---
+
 ## Summary for the NR team
 
 1. **Should-fix (blocker)**: TLS mismatch between NR Node agent v11+ and
    the chart's `nrproprietaryreceiver`. The chart ships plain HTTP only;
    the agent forces TLS. Customers can't actually point recent NR agents
    at PCG as deployed by the chart.
-2. **Should-fix (major)**: NR Node.js OTel bridge's `trace.getActiveSpan()`
+2. **Should-fix (blocker for arm64)**: PCG image is single-arch (AMD64
+   only). On arm64 nodes — Apple Silicon, Graviton — the image runs under
+   emulation and outbound TLS handshakes corrupt. See #7.
+3. **Should-fix (major)**: NR Node.js OTel bridge's `trace.getActiveSpan()`
    returns a context-only stub without mutation methods for
    auto-instrumented spans. Docs' "Events on spans: ✓" for Node.js does
    not apply to the common case; third-party OTel-aware hooks silently
    fail. See #6.
-3. **Should-fix**: `otlp/receiver` should bind to `0.0.0.0`, not
+4. **Should-fix**: `otlp/receiver` should bind to `0.0.0.0`, not
    `${env:MY_POD_IP}`. Fixes port-forward and matches `nrproprietaryreceiver`.
-4. **Should-document-or-broaden**: The processor allowlist (no `batch`, no
+5. **Should-document-or-broaden**: The processor allowlist (no `batch`, no
    `groupbytrace`, etc.) needs to be visible in docs, and ideally include
    `batch` + `groupbytrace` so LD's published Collector config runs unchanged.
-5. **Nice-to-fix**: Wire `CLUSTER_NAME` into the deployment env so the
+6. **Nice-to-fix**: Wire `CLUSTER_NAME` into the deployment env so the
    built-in prometheus scrape labels work.
-6. **Nice-to-fix**: Make the `feature_flag.opentelemetry_bridge → opentelemetry_bridge.enabled` config migration more obvious — either alias it, or surface the "ignored" message more visibly.
+7. **Nice-to-fix**: Make the `feature_flag.opentelemetry_bridge → opentelemetry_bridge.enabled` config migration more obvious — either alias it, or surface the "ignored" message more visibly.
 
 Happy to provide the repo, kind commands, and values file if useful — all
 committed at `ld_new_relic/demo/` in this repo.
