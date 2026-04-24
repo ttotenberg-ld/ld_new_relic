@@ -24,6 +24,15 @@ autoscaling:
   minReplicas: 1
   maxReplicas: 1
 
+# Expose LD_SDK_KEY inside the PCG container so the transform processor can
+# stamp launchdarkly.project_id on the OTel resource. The value is supplied
+# at install time via `--set-string 'deployment.envs[0].value=$LD_SDK_KEY'`
+# so the key itself doesn't live in a committed file.
+deployment:
+  envs:
+    - name: LD_SDK_KEY
+      value: ""
+
 generated:
   # Override the default nrproprietaryreceiver to point at NR production
   # (chart defaults target NR staging endpoints).
@@ -66,6 +75,18 @@ generated:
   # accept partial batches and assemble by trace_id) or not at all. For this
   # PoC we skip both; the LD filter chain still runs.
   processors:
+    # Stamp launchdarkly.project_id on the OTel resource for every span in the
+    # LD pipeline. Required for LD to route the trace to the right project.
+    # Necessary for NR-agent-origin spans (whose resource is derived by PCG
+    # and won't carry launchdarkly.project_id from the app side); harmless for
+    # OTel-SDK-origin spans that already set it at SDK init.
+    transform/launchdarkly-project-id:
+      error_mode: ignore
+      trace_statements:
+        - context: resource
+          statements:
+            - set(attributes["launchdarkly.project_id"], "${env:LD_SDK_KEY}")
+
     # LD filter stage 1: keep only span events relevant to guarded rollouts
     # (feature_flag events in experiment + exception events). Verbatim from
     # https://launchdarkly.com/docs/sdk/features/opentelemetry-server-side
@@ -94,6 +115,7 @@ generated:
       "traces/launchdarkly":
         receivers: [otlp/receiver, nrproprietaryreceiver]
         processors:
+          - transform/launchdarkly-project-id
           - filter/launchdarkly-spanevents
           - filter/launchdarkly-spans
         exporters: [otlphttp/launchdarkly]

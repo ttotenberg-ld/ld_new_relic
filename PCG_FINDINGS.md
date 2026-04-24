@@ -446,6 +446,44 @@ Or install the LaunchDarkly TracingHook on the LD SDK and watch for the
 
 ---
 
+## 6b. Empirical confirmation: attribute-shaped NR-agent data silently fails at LD's ingest
+
+Once the TLS and arm64 blockers are worked around (TLS terminator in front of
+PCG on a native-AMD64 host), end-to-end validation confirms what #6 predicts:
+
+Measured pipeline throughput with 3 minutes of simulator traffic:
+
+| Stage | Count |
+|---|---|
+| `nrproprietaryreceiver` accepted (NR-agent origin) | 398 |
+| `otlp/receiver` accepted (OTel SDK origin) | 6,434 |
+| `otlphttp/launchdarkly` successfully sent | 6,306 |
+| `otlphttp/launchdarkly` failed | 0 |
+| `filter/launchdarkly-spanevents` events dropped | **0** |
+
+The `filter/launchdarkly-spanevents` counter sits at 0 specifically because
+the NR-agent-origin spans carry **no** span events at all — the native-API
+hook we had to fall back on for NR-agent customers (see #6) produces
+`feature_flag.*` data as span attributes, not events. The spans survive the
+filter chain on the strength of their `http.route` attribute, arrive at
+LaunchDarkly's OTLP endpoint with an HTTP 200, and are silently dropped by
+LD's ingest because LD looks for span *events* named `feature_flag` with
+`inExperiment=true`.
+
+So the architectural story for NR-agent customers routing through PCG is:
+bytes flow, but no useful signal reaches LD's Guarded Rollouts engine.
+Closing this gap requires either
+
+- a PCG-side `transform` processor that synthesises span events from
+  attribute-shaped data (this is feasible — `transform` is in PCG's
+  allowlist — but writing the OTTL is non-trivial and would need to live in
+  LD's published docs), or
+- LD-side ingest support for attribute-shaped flag data (preferred; removes
+  the shape-mismatch burden from every customer and aligns with an eventual
+  LD-built NR Ingest Service, EXPLORATION.md Option D).
+
+---
+
 ## 7. PCG image is AMD64-only — crypto fails under QEMU emulation on Apple Silicon
 
 **Symptoms**

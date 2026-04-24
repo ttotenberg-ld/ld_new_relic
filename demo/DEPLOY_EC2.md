@@ -1,6 +1,6 @@
 # Running the demo on EC2 (amd64)
 
-The PCG container image is AMD64-only (see [`../PCG_FINDINGS.md`](../PCG_FINDINGS.md) #7). On Apple Silicon dev machines it runs under QEMU emulation, and the emulated crypto layer corrupts PCG's outbound TLS handshake to NR cloud — blocking the NR-agent → PCG leg end-to-end.
+The PCG container image is AMD64-only (see `[../PCG_FINDINGS.md](../PCG_FINDINGS.md)` #7). On Apple Silicon dev machines it runs under QEMU emulation, and the emulated crypto layer corrupts PCG's outbound TLS handshake to NR cloud — blocking the NR-agent → PCG leg end-to-end.
 
 Running the same demo on a native x86_64 Linux host (e.g. an EC2 instance) sidesteps the emulation entirely and lets us validate:
 
@@ -15,14 +15,16 @@ This is a throwaway demo box. Terminate it when you're done.
 
 ### Recommended specs
 
-| Setting | Value |
-|---|---|
-| **AMI** | Ubuntu Server 24.04 LTS (amd64) |
-| **Instance type** | `t3.large` (2 vCPU, 8 GiB) — enough headroom for kind + PCG + 3 demo services. Bump to `t3.xlarge` if you see OOM kills. |
-| **Architecture** | x86_64 (**not** arm64 / Graviton — that's what we're trying to avoid) |
-| **Storage** | 40 GiB gp3 (20 GiB fills up once kind + PCG + three Node images are all on disk) |
-| **Key pair** | Bring your own SSH key |
-| **Security group** | Inbound: SSH (22) from your IP only. Outbound: all (needed for NR + LD + apt + Docker Hub). |
+
+| Setting            | Value                                                                                                                    |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| **AMI**            | Ubuntu Server 24.04 LTS (amd64)                                                                                          |
+| **Instance type**  | `t3.large` (2 vCPU, 8 GiB) — enough headroom for kind + PCG + 3 demo services. Bump to `t3.xlarge` if you see OOM kills. |
+| **Architecture**   | x86_64 (**not** arm64 / Graviton — that's what we're trying to avoid)                                                    |
+| **Storage**        | 40 GiB gp3 (20 GiB fills up once kind + PCG + three Node images are all on disk)                                         |
+| **Key pair**       | Bring your own SSH key                                                                                                   |
+| **Security group** | Inbound: SSH (22) from your IP only. Outbound: all (needed for NR + LD + apt + Docker Hub).                              |
+
 
 ### CLI shortcut
 
@@ -106,10 +108,20 @@ helm version
 git clone <this-repo> ld_new_relic
 cd ld_new_relic/demo
 cp .env.example .env
-nano .env   # fill in LD_SDK_KEY, NEW_RELIC_LICENSE_KEY
+nano .env   # fill in LD_SDK_KEY and NEW_RELIC_LICENSE_KEY
 ```
 
-Leave `NEW_RELIC_HOST=pcg-tls` in `.env` (that's the in-compose TLS terminator — not `collector.newrelic.com` and not `host.docker.internal`).
+While you're editing `.env`:
+
+- Leave `NEW_RELIC_HOST=pcg-tls` (the in-compose TLS terminator — not `collector.newrelic.com` and not `host.docker.internal`).
+- Add `NEW_RELIC_PORT=8080`. We'll port-forward PCG's NR-agent-protocol receiver to host port 8080 in step 6 (avoids needing `sudo` for port 80).
+
+Your `.env` should end with something like:
+
+```
+NEW_RELIC_HOST=pcg-tls
+NEW_RELIC_PORT=8080
+```
 
 ## 4. Stand up the kind cluster + PCG
 
@@ -119,6 +131,7 @@ kind create cluster --name ld-nr-demo
 
 # Install PCG
 export NEW_RELIC_LICENSE_KEY=$(grep NEW_RELIC_LICENSE_KEY .env | cut -d= -f2)
+export LD_SDK_KEY=$(grep LD_SDK_KEY .env | cut -d= -f2)
 helm repo add newrelic https://helm-charts.newrelic.com
 helm repo update
 cd pcg
@@ -127,7 +140,9 @@ helm upgrade --install pipeline-control-gateway \
   --namespace newrelic --create-namespace \
   --values values-newrelic-gateway.yaml \
   --set licenseKey=$NEW_RELIC_LICENSE_KEY \
-  --set cluster=ld-nr-demo
+  --set cluster=ld-nr-demo \
+  --set-string "deployment.envs[0].name=LD_SDK_KEY" \
+  --set-string "deployment.envs[0].value=$LD_SDK_KEY"
 cd ..
 
 # Wait for PCG to be ready
@@ -145,24 +160,28 @@ bash pcg/tls/gen.sh
 On EC2 we want port-forward to survive SSH disconnects. Use `nohup`, and bind PCG's NR-agent receiver to a non-privileged host port (8080) so we don't need `sudo` (which would run `kubectl` as root and miss your kubeconfig):
 
 ```bash
-nohup kubectl -n newrelic port-forward svc/pipeline-control-gateway \
+nohup kubectl -n newrelic port-forward --address 0.0.0.0 \
+  svc/pipeline-control-gateway \
   4317:4317 4318:4318 8080:80 \
   > /tmp/pcg-portforward.log 2>&1 &
 
 sleep 2
 ss -tlnp | grep -E ':(8080|4318)\b'
+# You should see 0.0.0.0:8080 and 0.0.0.0:4318 — not 127.0.0.1
 ```
 
-Then tell the NR agent to hit port 8080 instead of the default 443. Edit `demo/.env` and add:
+`--address 0.0.0.0` is important on Linux. By default `kubectl port-forward` binds loopback only, and the Caddy container's `host.docker.internal:8080` lookup resolves to the host's real interface rather than loopback — so the default bind gives you 502s from Caddy.
 
-```
-NEW_RELIC_PORT=8080
-```
-
-And update the Caddyfile to forward to 8080 instead of 80. Edit `demo/pcg/tls/Caddyfile`, change the `reverse_proxy` line to:
+`.env` already points the NR agent at port 8080 (from step 3). The remaining change is to tell Caddy to forward there too. Edit `demo/pcg/tls/Caddyfile` and change the one `reverse_proxy` line to:
 
 ```
 reverse_proxy http://host.docker.internal:8080
+```
+
+Or via sed:
+
+```bash
+sed -i 's|host.docker.internal:80|host.docker.internal:8080|' pcg/tls/Caddyfile
 ```
 
 (If you do want the agent and Caddy talking on the standard :80 host port, you'd need `sudo kubectl --kubeconfig=$HOME/.kube/config ...` to preserve the user's cluster config. The 8080 path sidesteps that entirely.)
@@ -226,3 +245,4 @@ aws ec2 terminate-instances --instance-ids i-xxxxxxxxxxxx
 
 - The TLS terminator (Caddy sidecar in docker-compose) is still needed on EC2. PCG's `nrproprietaryreceiver` is plain HTTP only regardless of host architecture — that's a chart-shipping gap, not an emulation issue. See `PCG_FINDINGS.md` #4.
 - Everything else in `PCG_FINDINGS.md` — the OTLP receiver binding (#1), the processor allowlist (#2), the Node.js OTel bridge stub (#6) — still applies on EC2. This guide gets you past the arm64-specific blocker (#7) only.
+
