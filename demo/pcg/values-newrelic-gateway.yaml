@@ -87,27 +87,27 @@ generated:
           statements:
             - set(attributes["launchdarkly.project_id"], "${env:LD_SDK_KEY}")
 
-    # LD filter stage 1: keep only span events relevant to guarded rollouts
-    # (feature_flag events in experiment + exception events). Verbatim from
-    # https://launchdarkly.com/docs/sdk/features/opentelemetry-server-side
+    # LD filter stage 1 (OTel path only): keep only span events relevant to
+    # guarded rollouts (feature_flag events in experiment + exception events).
+    # Verbatim from https://launchdarkly.com/docs/sdk/features/opentelemetry-server-side
+    # NOT applied to the NR-agent path: the NR Node agent's OTel bridge
+    # doesn't expose a functional Span.addEvent, so NR-agent-origin spans
+    # carry feature_flag data as attributes instead of events (PCG_FINDINGS.md #6).
     filter/launchdarkly-spanevents:
       error_mode: ignore
       traces:
         spanevent:
           - 'not ((name == "feature_flag" and attributes["feature_flag.result.reason.inExperiment"] == true) or name == "exception")'
 
-    # LD filter stage 2: drop spans that carry no useful correlation signal.
-    # We keep a span if it has any of: an HTTP route/url/target (so we don't
-    # lose NR-agent-origin HTTP spans, which use `http.url`/`http.target`
-    # rather than `http.route`), a feature_flag.* attribute (NR-agent-origin
-    # spans carry flag data in attributes, not events, because the NR Node
-    # agent's OTel bridge doesn't expose a functional Span.addEvent — see
-    # PCG_FINDINGS.md #6), or a surviving event after stage 1.
+    # LD filter stage 2 (OTel path only): drop spans with no http.route and no
+    # surviving events. NOT applied to the NR-agent path because PCG's
+    # proprietary-receiver translation doesn't set http.route and the spans
+    # have no events for the reason above.
     filter/launchdarkly-spans:
       error_mode: ignore
       traces:
         span:
-          - 'not (attributes["http.route"] != nil or attributes["http.url"] != nil or attributes["http.target"] != nil or attributes["feature_flag.key"] != nil or Len(events) > 0)'
+          - 'not (attributes["http.route"] != nil or Len(events) > 0)'
 
   exporters:
     # LaunchDarkly OTLP endpoint. No auth header — the TracingHook sets
@@ -123,11 +123,22 @@ generated:
 
   service:
     pipelines:
-      # Fork both origins (OTLP + NR agent) into the LD filter pipeline.
+      # OTel-SDK origin → LD. Keep the standard LD filter chain (spanevents +
+      # http.route/events) since OTel-SDK apps emit feature_flag span events
+      # and carry http.route, so the filters work as intended.
       "traces/launchdarkly":
-        receivers: [otlp/receiver, nrproprietaryreceiver]
+        receivers: [otlp/receiver]
         processors:
           - transform/launchdarkly-project-id
           - filter/launchdarkly-spanevents
           - filter/launchdarkly-spans
+        exporters: [otlphttp/launchdarkly, debug/launchdarkly]
+      # NR-agent origin → LD. No filters: the NR Node agent's OTel bridge
+      # doesn't expose Span.addEvent (PCG_FINDINGS.md #6), so NR-agent spans
+      # arrive without the span events or http.route the LD filters require.
+      # Send everything straight through; noise reduction happens LD-side.
+      "traces/launchdarkly-nr":
+        receivers: [nrproprietaryreceiver]
+        processors:
+          - transform/launchdarkly-project-id
         exporters: [otlphttp/launchdarkly, debug/launchdarkly]
