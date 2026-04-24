@@ -96,12 +96,18 @@ generated:
         spanevent:
           - 'not ((name == "feature_flag" and attributes["feature_flag.result.reason.inExperiment"] == true) or name == "exception")'
 
-    # LD filter stage 2: drop spans with no http.route and no surviving events.
+    # LD filter stage 2: drop spans that carry no useful correlation signal.
+    # We keep a span if it has any of: an HTTP route/url/target (so we don't
+    # lose NR-agent-origin HTTP spans, which use `http.url`/`http.target`
+    # rather than `http.route`), a feature_flag.* attribute (NR-agent-origin
+    # spans carry flag data in attributes, not events, because the NR Node
+    # agent's OTel bridge doesn't expose a functional Span.addEvent — see
+    # PCG_FINDINGS.md #6), or a surviving event after stage 1.
     filter/launchdarkly-spans:
       error_mode: ignore
       traces:
         span:
-          - 'not (attributes["http.route"] != nil or Len(events) > 0)'
+          - 'not (attributes["http.route"] != nil or attributes["http.url"] != nil or attributes["http.target"] != nil or attributes["feature_flag.key"] != nil or Len(events) > 0)'
 
   exporters:
     # LaunchDarkly OTLP endpoint. No auth header — the TracingHook sets
