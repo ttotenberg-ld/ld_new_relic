@@ -109,6 +109,12 @@ generated:
     otlphttp/launchdarkly:
       endpoint: https://otel.observability.app.launchdarkly.com:4318
 
+    # Temporary: log every span that leaves the LD pipeline so we can see
+    # which receiver produced it and what attributes/events it carries.
+    # Remove once NR-agent-origin spans are confirmed flowing to LD.
+    debug/launchdarkly:
+      verbosity: detailed
+
   service:
     pipelines:
       # Fork both origins (OTLP + NR agent) into the LD filter pipeline.
@@ -118,4 +124,4 @@ generated:
           - transform/launchdarkly-project-id
           - filter/launchdarkly-spanevents
           - filter/launchdarkly-spans
-        exporters: [otlphttp/launchdarkly]
+        exporters: [otlphttp/launchdarkly, debug/launchdarkly]
