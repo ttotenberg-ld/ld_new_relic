@@ -20,7 +20,7 @@ This is a throwaway demo box. Terminate it when you're done.
 | **AMI** | Ubuntu Server 24.04 LTS (amd64) |
 | **Instance type** | `t3.large` (2 vCPU, 8 GiB) — enough headroom for kind + PCG + 3 demo services. Bump to `t3.xlarge` if you see OOM kills. |
 | **Architecture** | x86_64 (**not** arm64 / Graviton — that's what we're trying to avoid) |
-| **Storage** | 20 GiB gp3 |
+| **Storage** | 40 GiB gp3 (20 GiB fills up once kind + PCG + three Node images are all on disk) |
 | **Key pair** | Bring your own SSH key |
 | **Security group** | Inbound: SSH (22) from your IP only. Outbound: all (needed for NR + LD + apt + Docker Hub). |
 
@@ -45,7 +45,7 @@ aws ec2 run-instances \
   --key-name YOUR_KEY_NAME \
   --security-group-ids $SG_ID \
   --associate-public-ip-address \
-  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=20,VolumeType=gp3}' \
+  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=40,VolumeType=gp3}' \
   --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ld-nr-demo}]'
 ```
 
@@ -142,21 +142,30 @@ bash pcg/tls/gen.sh
 
 ## 6. Start the port-forward as a background service
 
-On EC2 we want port-forward to survive SSH disconnects. Use `systemd-run --user` or just run under `nohup`:
+On EC2 we want port-forward to survive SSH disconnects. Use `nohup`, and bind PCG's NR-agent receiver to a non-privileged host port (8080) so we don't need `sudo` (which would run `kubectl` as root and miss your kubeconfig):
 
 ```bash
-nohup sudo kubectl -n newrelic port-forward svc/pipeline-control-gateway \
-  4317:4317 4318:4318 80:80 \
+nohup kubectl -n newrelic port-forward svc/pipeline-control-gateway \
+  4317:4317 4318:4318 8080:80 \
   > /tmp/pcg-portforward.log 2>&1 &
+
+sleep 2
+ss -tlnp | grep -E ':(8080|4318)\b'
 ```
 
-(`sudo` is only needed for binding :80 on the host; no other privileged operation here.)
+Then tell the NR agent to hit port 8080 instead of the default 443. Edit `demo/.env` and add:
 
-Check it's listening:
-
-```bash
-ss -tlnp | grep -E ':80|:4318'
 ```
+NEW_RELIC_PORT=8080
+```
+
+And update the Caddyfile to forward to 8080 instead of 80. Edit `demo/pcg/tls/Caddyfile`, change the `reverse_proxy` line to:
+
+```
+reverse_proxy http://host.docker.internal:8080
+```
+
+(If you do want the agent and Caddy talking on the standard :80 host port, you'd need `sudo kubectl --kubeconfig=$HOME/.kube/config ...` to preserve the user's cluster config. The 8080 path sidesteps that entirely.)
 
 ## 7. Launch the demo stack
 
