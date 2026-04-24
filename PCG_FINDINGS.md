@@ -337,20 +337,134 @@ Stack Overflow answers mislead users" problem.
 
 ---
 
+## 6. NR Node.js OTel bridge: `trace.getActiveSpan()` returns a context-only stub with no Span API — "Events on spans: ✓" in the docs is misleading
+
+**Symptoms**
+
+After enabling the OTel bridge (`opentelemetry_bridge.enabled: true`) and
+calling `@opentelemetry/api`'s `trace.getActiveSpan()` inside a route handler
+that the NR agent has auto-instrumented, the returned object looks like an
+OTel `Span` but is missing all the mutation methods. When the LaunchDarkly
+TracingHook from `@launchdarkly/node-server-sdk-otel` calls
+`span.addEvent('feature_flag', {...})`, it throws:
+
+```
+TypeError: currentTrace.addEvent is not a function
+```
+
+The LD SDK catches this silently, so nothing surfaces except in the SDK's
+own log channel.
+
+**Evidence** (from an in-process diagnostic hook):
+
+```
+[diag] after flag=demo-flag spanImpl=FakeSpan addEvent=type=undefined
+       methods=[constructor, spanContext, segmentId, traceId]
+       nrSpanId=c0039eb8d2c12a9b inExperiment=undefined
+```
+
+The "span" has exactly four methods — enough for distributed-tracing
+context propagation (so trace IDs flow through OTel propagators), but no
+`addEvent`, no `setAttribute`, no `setStatus`, no `end`. Agent version:
+`newrelic` v12.25.1. Config:
+
+```js
+opentelemetry_bridge: {
+  enabled: true,
+  traces: { enabled: true },
+}
+```
+
+**What's actually going on**
+
+The OTel bridge appears to install a full OTel-compatible `Span` wrapper
+only when spans are created **via the OTel API** (i.e. the user code calls
+`tracer.startSpan()`). Spans created by NR's native auto-instrumentation
+(the common case: Fastify/Express/HTTP request spans that show up in NR's
+Distributed Tracing UI) are NR-native, and the bridge exposes just enough
+of them through `trace.getActiveSpan()` for context ID access. Calls like
+`addEvent` on that stub throw.
+
+**Why this matters**
+
+The NR docs
+(<https://docs.newrelic.com/docs/apm/agents/manage-apm-agents/opentelemetry-api-support/>)
+show Node.js with "Events on spans: ✓" next to .NET and Java. Customers
+reasonably interpret this to mean "I can take any OTel-aware library (like
+a LaunchDarkly, OpenFeature, or Sentry hook) that calls
+`trace.getActiveSpan().addEvent(...)`, drop in the NR agent, and have the
+enrichment work." In practice this common pattern silently doesn't work
+for auto-instrumented spans. It only works if the user explicitly wraps
+their own logic in `tracer.startActiveSpan()`.
+
+This materially affects the LaunchDarkly integration story:
+
+- **Goal 1** (flag attributes visible in NR dashboards): needs a custom
+  hook using `newrelic.addCustomSpanAttribute()` instead of the
+  general-purpose OTel TracingHook.
+- **Goal 2** (NR-agent-originated traces forwarded through PCG to LD):
+  even once the TLS blocker (#4) is solved, the data shape won't match
+  LD's published OTTL filter — LD looks for span *events* named
+  `feature_flag`; NR-native attribute enrichment produces span *attributes*
+  instead. PCG would need a second, attribute-shaped filter pipeline for
+  NR-agent-origin traffic.
+
+**Reproduction**
+
+Any Node.js app with the NR agent loaded (via `-r newrelic`) and
+`opentelemetry_bridge.enabled: true`. Inside any framework route handler:
+
+```js
+const { trace } = require('@opentelemetry/api');
+app.get('/x', () => {
+  const span = trace.getActiveSpan();
+  console.log(typeof span.addEvent); // → "undefined"
+});
+```
+
+Or install the LaunchDarkly TracingHook on the LD SDK and watch for the
+`afterEvaluation` error in your LD SDK logs.
+
+**Suggested fixes (pick one)**
+
+1. **Wrap NR-native spans with a full OTel `Span` shim**. When
+   `trace.getActiveSpan()` is called and there's an active NR transaction,
+   return a wrapper whose `addEvent` maps to
+   `newrelic.recordCustomEvent()` or appends attributes to the current NR
+   segment; `setAttribute` maps to `addCustomSpanAttribute`; `end` / others
+   are no-ops. This makes the docs' "Events on spans: ✓" claim true for
+   the natural use case.
+2. **If (1) is infeasible for architectural reasons, revise the docs.**
+   The current matrix row should explicitly say something like:
+   "Events-on-spans work for user-created OTel spans, not for spans
+   produced by NR's auto-instrumentation. Use
+   `newrelic.addCustomSpanAttribute()` to enrich auto-instrumented spans."
+3. **Log a clear error at the source.** When a user calls `.addEvent()`
+   on the returned stub, surface an informative error via the agent's
+   logger pointing to the documented alternative, instead of silently
+   throwing `TypeError`.
+
+---
+
 ## Summary for the NR team
 
 1. **Should-fix (blocker)**: TLS mismatch between NR Node agent v11+ and
    the chart's `nrproprietaryreceiver`. The chart ships plain HTTP only;
    the agent forces TLS. Customers can't actually point recent NR agents
    at PCG as deployed by the chart.
-2. **Should-fix**: `otlp/receiver` should bind to `0.0.0.0`, not
+2. **Should-fix (major)**: NR Node.js OTel bridge's `trace.getActiveSpan()`
+   returns a context-only stub without mutation methods for
+   auto-instrumented spans. Docs' "Events on spans: ✓" for Node.js does
+   not apply to the common case; third-party OTel-aware hooks silently
+   fail. See #6.
+3. **Should-fix**: `otlp/receiver` should bind to `0.0.0.0`, not
    `${env:MY_POD_IP}`. Fixes port-forward and matches `nrproprietaryreceiver`.
-3. **Should-document-or-broaden**: The processor allowlist (no `batch`, no
+4. **Should-document-or-broaden**: The processor allowlist (no `batch`, no
    `groupbytrace`, etc.) needs to be visible in docs, and ideally include
    `batch` + `groupbytrace` so LD's published Collector config runs unchanged.
-4. **Nice-to-fix**: Wire `CLUSTER_NAME` into the deployment env so the
+5. **Nice-to-fix**: Wire `CLUSTER_NAME` into the deployment env so the
    built-in prometheus scrape labels work.
-5. **Nice-to-fix**: Make the `feature_flag.opentelemetry_bridge → opentelemetry_bridge.enabled` config migration more obvious — either alias it, or surface the "ignored" message more visibly.
+6. **Nice-to-fix**: Make the `feature_flag.opentelemetry_bridge → opentelemetry_bridge.enabled` config migration more obvious — either alias it, or surface the "ignored" message more visibly.
 
 Happy to provide the repo, kind commands, and values file if useful — all
 committed at `ld_new_relic/demo/` in this repo.
