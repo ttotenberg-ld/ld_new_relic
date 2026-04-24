@@ -544,28 +544,255 @@ dependencies (OTel Collector, Go crypto) already support arm64 upstream.
 
 ---
 
+## 8. `nrproprietaryreceiver` drops the NR agent's `app_name` — NR-origin spans arrive with no `service.name` resource attribute
+
+**Symptoms**
+
+With a dedicated `traces/launchdarkly-nr` pipeline and a `debug` exporter
+attached, an NR-agent-origin ResourceSpans batch looks like this:
+
+```
+ResourceSpans #0
+Resource SchemaURL:
+Resource attributes:
+     -> nr.reservoirSize: Int(2000)
+     -> nr.eventsSeen: Int(44)
+     -> launchdarkly.project_id: Str(sdk-...)   # stamped by our OTTL transform
+ScopeSpans #0
+InstrumentationScope
+Span #0
+    Name           : Nodejs/Middleware/Fastify/<anonymous>//search
+    ...
+```
+
+Compared to the same exporter's output for an OTel-SDK-origin batch, which
+has ~15 resource attributes including `service.name`, `service.version`,
+`telemetry.sdk.*`, `process.*`, `host.name`, etc. No `service.name`. No
+`app.name`. No `newrelic.app.name`. No `entity.guid`. Nothing that
+identifies the originating application.
+
+Meanwhile the NR agent **has** an `app_name` — confirmed directly from the
+live agent process:
+
+```bash
+docker exec nr-agent-service node -e \
+  'const nr=require("newrelic");console.log(nr.agent.config.app_name)'
+# → app_name: [ 'ld-nr-demo-agent-service' ]
+```
+
+So the information is present on the agent side and sent over the
+proprietary protocol, but it's discarded during the proprietary→OTel
+translation inside PCG.
+
+**Impact**
+
+- Any downstream OTel consumer (LaunchDarkly, Tempo, Datadog, Honeycomb,
+  a second NR account via OTLP) that filters or groups traces by
+  `service.name` sees a single anonymous bucket for all NR-agent-origin
+  traces. UI filtering and correlation break.
+- The loss is silent. The spans arrive fine, and the `nrcollectorexporter`
+  path still forwards them to NR cloud using the original proprietary
+  payload (which embeds `app_name` separately, outside the OTel resource
+  schema). So NR's own UI looks correct and the problem is invisible
+  unless you're inspecting the OTel output path.
+
+**Reproduction**
+
+Stand up PCG with a `debug` exporter on any pipeline that includes
+`nrproprietaryreceiver`. Point a NR Node agent at PCG (via a TLS
+terminator, per #4). Grep the debug output for NR-origin batches — they
+have `nr.reservoirSize` / `nr.eventsSeen` but no `service.name`.
+
+**Workaround**
+
+Conditional OTTL `set` in a `transform` processor on the NR pipeline —
+harmless for OTel-SDK-origin spans (they already set `service.name` at SDK
+init), stamps a literal on NR-origin:
+
+```yaml
+transform/launchdarkly-project-id:
+  trace_statements:
+    - context: resource
+      statements:
+        - set(attributes["launchdarkly.project_id"], "${env:LD_SDK_KEY}")
+        - set(attributes["service.name"], "ld-nr-demo-agent-service") where attributes["service.name"] == nil
+```
+
+This only holds up when one PCG serves one NR-agent-instrumented service.
+With multiple apps behind the same PCG the literal isn't viable — you'd
+need the receiver to preserve `app_name` per-request.
+
+**Suggested fix**
+
+In `nrproprietaryreceiver`, map the NR agent's `app_name` onto
+`service.name` on the Resource of every translated span, alongside any
+other proprietary-to-OTel mappings the receiver already does. If
+`app_name` is an array (NR supports rollup app names), take the first
+element or join with `;`.
+
+---
+
+## 9. `nrproprietaryreceiver` emits NR-origin spans with `1970-01-01 00:00:00` timestamps — wall-clock time is lost in translation
+
+**Symptoms**
+
+An NR-agent-origin span coming out of PCG's `debug` exporter:
+
+```
+Span #0
+    Trace ID       : 3918ddc39333681158ab105d158feb1d
+    Parent ID      : 2f61f22fbacbcece
+    ID             : 168bf81b98069c83
+    Name           : Nodejs/Middleware/Fastify/<anonymous>//search
+    Kind           : Unspecified
+    Start time     : 1970-01-01 00:00:00 +0000 UTC
+    End time       : 1970-01-01 00:00:00.002096322 +0000 UTC
+    Status code    : Unset
+    Status message :
+Attributes:
+     -> nr_exclusive_duration_millis: Double(2.096323)
+```
+
+Duration is preserved (≈ 2.096 ms) and stored in a custom attribute. But
+both absolute timestamps are effectively zero — `end - start` equals the
+duration, yet both are anchored at the Unix epoch rather than at the
+span's actual wall-clock start.
+
+**What's happening**
+
+The NR proprietary protocol represents span timing as relative offsets
+from a transaction's start time, not as absolute timestamps. PCG's
+`nrproprietaryreceiver` appears to populate the OTel
+`start_time_unix_nano` / `end_time_unix_nano` fields from those relative
+offsets directly, without anchoring to the transaction's wall-clock
+start. Result: every NR-origin span ends up at the Unix epoch.
+
+**Impact**
+
+- Any OTLP consumer that trusts span timestamps for timeline placement —
+  trace waterfall views, time-window alerts, retention policies — will
+  place every NR-origin span at 1970.
+- LaunchDarkly's OTel observability endpoint is likely to reject or hide
+  spans whose end time is decades in the past, defeating the forking
+  story this whole integration is built around. (Bytes reach LD, signal
+  doesn't surface.)
+- The `nrcollectorexporter` path is unaffected — proprietary-to-NR-cloud
+  forwarding carries the original payload intact, so NR Distributed
+  Tracing still works. Only the OTel-shaped export is broken.
+
+**Workaround**
+
+None practical inside PCG. OTTL's `transform` processor can rewrite
+timestamps, but by the time processors run the real start time has
+already been flattened to epoch — the information is gone. The only
+host-side workaround is to bypass the proprietary path entirely: enable
+the NR Node agent's OpenTelemetry bridge
+(`opentelemetry_bridge.enabled: true`) and export OTLP directly to PCG's
+`otlp/receiver`. That works for user-created spans but not for
+auto-instrumented ones (see #6).
+
+**Suggested fix**
+
+`nrproprietaryreceiver` should extract the transaction's wall-clock start
+from the proprietary payload (it's encoded there — the agent sends
+timestamps in its metric/event payloads and absolute timestamps in its
+span events) and anchor each span's `start_time_unix_nano` to
+`transaction_start + relative_offset`.
+
+---
+
+## 10. Default `otlphttp` exporter constructs a malformed metrics URL (`.../v1/traces/v1/metrics`)
+
+**Symptoms**
+
+On every metrics harvest, PCG logs:
+
+```
+error internal/queue_sender.go:49 Exporting failed. Dropping data.
+  {"otelcol.component.id": "otlphttp",
+   "otelcol.component.kind": "exporter",
+   "otelcol.signal": "metrics",
+   "error": "not retryable error: Permanent error:
+             rpc error: code = Unimplemented desc =
+             error exporting items, request to
+             https://otlp.nr-data.net/v1/traces/v1/metrics
+             responded with HTTP Status Code 404",
+   "dropped_items": 233}
+```
+
+Note the doubled path: `v1/traces/v1/metrics`.
+
+**What's happening**
+
+The chart's default `otlphttp` exporter (in `generated.exporters.otlphttp`)
+sets its `endpoint` (or `traces_endpoint`) to
+`https://otlp.nr-data.net/v1/traces` and then derives the metrics endpoint
+by appending `v1/metrics` without stripping the traces path first. Looks
+like a small config bug in the chart defaults.
+
+**Impact**
+
+- Every NR-cloud metrics harvest routed through this exporter fails with
+  404. On our PoC, `dropped_items` was 233 per batch.
+- Noisy logs (one error per harvest interval, by default every 60 s).
+- The NR-agent → `nrcollectorexporter` path isn't affected, so APM
+  metrics still flow via the proprietary payload. But anything routed
+  through the OTel `metrics/*` pipeline is silently dropped.
+
+**Suggested fix**
+
+Use distinct endpoint keys in the chart default:
+
+```yaml
+otlphttp:
+  traces_endpoint:  https://otlp.nr-data.net/v1/traces
+  metrics_endpoint: https://otlp.nr-data.net/v1/metrics
+  logs_endpoint:    https://otlp.nr-data.net/v1/logs
+```
+
+or set a single base `endpoint: https://otlp.nr-data.net` and let the
+exporter derive paths. The current chart default concatenates incorrectly.
+
+---
+
 ## Summary for the NR team
 
 1. **Should-fix (blocker)**: TLS mismatch between NR Node agent v11+ and
    the chart's `nrproprietaryreceiver`. The chart ships plain HTTP only;
    the agent forces TLS. Customers can't actually point recent NR agents
-   at PCG as deployed by the chart.
+   at PCG as deployed by the chart. See #4.
 2. **Should-fix (blocker for arm64)**: PCG image is single-arch (AMD64
    only). On arm64 nodes — Apple Silicon, Graviton — the image runs under
    emulation and outbound TLS handshakes corrupt. See #7.
-3. **Should-fix (major)**: NR Node.js OTel bridge's `trace.getActiveSpan()`
-   returns a context-only stub without mutation methods for
-   auto-instrumented spans. Docs' "Events on spans: ✓" for Node.js does
-   not apply to the common case; third-party OTel-aware hooks silently
-   fail. See #6.
-4. **Should-fix**: `otlp/receiver` should bind to `0.0.0.0`, not
-   `${env:MY_POD_IP}`. Fixes port-forward and matches `nrproprietaryreceiver`.
-5. **Should-document-or-broaden**: The processor allowlist (no `batch`, no
-   `groupbytrace`, etc.) needs to be visible in docs, and ideally include
-   `batch` + `groupbytrace` so LD's published Collector config runs unchanged.
-6. **Nice-to-fix**: Wire `CLUSTER_NAME` into the deployment env so the
-   built-in prometheus scrape labels work.
-7. **Nice-to-fix**: Make the `feature_flag.opentelemetry_bridge → opentelemetry_bridge.enabled` config migration more obvious — either alias it, or surface the "ignored" message more visibly.
+3. **Should-fix (blocker for OTel forking)**: `nrproprietaryreceiver`
+   emits NR-origin spans with `start_time_unix_nano = 0`. Any OTel
+   consumer that trusts timestamps (including LD) will reject or misplace
+   every NR-agent-originated span. See #9.
+4. **Should-fix (major for OTel forking)**: `nrproprietaryreceiver`
+   doesn't map the NR agent's `app_name` onto `service.name` on
+   translated resources. Every NR-agent trace looks unattributed in the
+   OTel output. See #8.
+5. **Should-fix (major)**: NR Node.js OTel bridge's
+   `trace.getActiveSpan()` returns a context-only stub without mutation
+   methods for auto-instrumented spans. Docs' "Events on spans: ✓" for
+   Node.js does not apply to the common case; third-party OTel-aware
+   hooks silently fail. See #6.
+6. **Should-fix**: `otlp/receiver` should bind to `0.0.0.0`, not
+   `${env:MY_POD_IP}`. Fixes port-forward and matches
+   `nrproprietaryreceiver`. See #1.
+7. **Should-fix**: Default `otlphttp` exporter posts metrics to a
+   double-pathed URL (`.../v1/traces/v1/metrics`) and 404s on every
+   harvest. See #10.
+8. **Should-document-or-broaden**: The processor allowlist (no `batch`,
+   no `groupbytrace`, etc.) needs to be visible in docs, and ideally
+   include `batch` + `groupbytrace` so LD's published Collector config
+   runs unchanged. See #2.
+9. **Nice-to-fix**: Wire `CLUSTER_NAME` into the deployment env so the
+   built-in prometheus scrape labels work. See #3.
+10. **Nice-to-fix**: Make the
+    `feature_flag.opentelemetry_bridge → opentelemetry_bridge.enabled`
+    config migration more obvious — either alias it, or surface the
+    "ignored" message more visibly. See #5.
 
 Happy to provide the repo, kind commands, and values file if useful — all
 committed at `ld_new_relic/demo/` in this repo.

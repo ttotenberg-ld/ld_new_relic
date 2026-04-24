@@ -86,6 +86,11 @@ generated:
         - context: resource
           statements:
             - set(attributes["launchdarkly.project_id"], "${env:LD_SDK_KEY}")
+            # PCG's nrproprietaryreceiver drops the NR agent's `app_name`
+            # during translation — NR-origin resources arrive with no
+            # `service.name`. Stamp one on when missing. Only fires for
+            # NR-origin spans (OTel-SDK spans already set this at SDK init).
+            - set(attributes["service.name"], "ld-nr-demo-agent-service") where attributes["service.name"] == nil
 
     # LD filter stage 1 (OTel path only): keep only span events relevant to
     # guarded rollouts (feature_flag events in experiment + exception events).
